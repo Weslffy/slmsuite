@@ -130,7 +130,7 @@ def take(
         s = np.asarray(size).ravel()
         size = (int(s[0]), int(s[1]))
 
-    vectors = np.floor(format_2vectors(vectors)).astype(int)
+    vectors = np.rint(format_2vectors(vectors)).astype(int)
 
     if xp is None:
         xp = np
@@ -226,8 +226,8 @@ def take_plot(images, shape=None, separate_axes=False, cbar=True):
     img_count, (M, N) = _take_parse_shape(images, shape)
 
     if separate_axes:
-        sx = sx / 2.0 - 0.5
-        sy = sy / 2.0 - 0.5
+        sx = sx / 2.0
+        sy = sy / 2.0
         extent = (-sx, sx, -sy, sy)
 
         vmin = np.nanmin(images)
@@ -237,7 +237,7 @@ def take_plot(images, shape=None, separate_axes=False, cbar=True):
         plt.figure(figsize=(12, 12))
 
         for x in range(img_count):
-            ax = plt.subplot(M, M, x + 1)
+            ax = plt.subplot(M, N, x + 1)
 
             ax.imshow(
                 images[x, :, :],
@@ -259,9 +259,9 @@ def take_plot(images, shape=None, separate_axes=False, cbar=True):
 
         # Draw horizontal and vertical lines to separate the images.
         for x in range(1, N):
-            ax.axvline(x=sx * x, color='r', linewidth=0.5)
+            ax.axvline(x=sx * x - 0.5, color='r', linewidth=0.5)
         for y in range(1, M):
-            ax.axhline(y=sy * y, color='r', linewidth=0.5)
+            ax.axhline(y=sy * y - 0.5, color='r', linewidth=0.5)
 
         if cbar:
             cax = make_axes_locatable(ax).append_axes("right", size="2%", pad=0.05)
