@@ -19,7 +19,7 @@ from slmsuite.holography import analysis
 from slmsuite.holography import toolbox
 from slmsuite.holography.algorithms import Hologram, SpotHologram, CompressedSpotHologram
 from slmsuite.holography.toolbox import imprint, format_2vectors, format_vectors, smallest_distance, fit_3pt, convert_vector
-from slmsuite.holography.toolbox.phase import blaze, _zernike_indices_parse, zernike, zernike_sum, binary
+from slmsuite.holography.toolbox.phase import blaze, _zernike_indices_parse, zernike, zernike_sum, binary, ZERNIKE_NAMES
 from slmsuite.holography.analysis import image_remove_blaze, image_remove_vortices, image_reduce_wraps
 from slmsuite.holography.analysis.files import load_h5, save_h5, generate_path, latest_path
 from slmsuite.holography.analysis.fitfunctions import cos, _sinc2d_nomod
@@ -2225,6 +2225,193 @@ class FourierSLM(CameraSLM):
 
         pass
 
+    def _wavefront_calibrate_zernike(
+        self,
+        calibration_points=None,
+        zernike_indices=9,
+        perturbation=(-np.pi, np.pi),
+        global_correction=False,
+        optimize_focus=True,
+        optimize_position=True,
+        optimize_weights=True,
+    ):
+        r"""
+        Interactive Jupyter widget for manual Zernike coefficient adjustment.
+
+        Provides a live camera view with sliders for each Zernike term,
+        allowing the user to manually tune coefficients and confirm optimal values.
+        The original :meth:`wavefront_calibrate_zernike` is not modified.
+
+        Parameters
+        ----------
+        calibration_points : numpy.ndarray OR float OR None
+            Same semantics as :meth:`wavefront_calibrate_zernike`.
+        zernike_indices : int OR list of int OR None
+            Same semantics as :meth:`wavefront_calibrate_zernike`.
+        perturbation : (float, float) OR float
+            Slider range in radians. A tuple ``(lower, upper)`` sets the slider
+            bounds directly. A scalar ``p`` is shorthand for ``(-|p|, |p|)``.
+        global_correction : bool
+            If ``True``, one slider adjusts all spots uniformly.
+            If ``False``, a spot selector allows per-spot coefficient tuning.
+        optimize_focus : bool
+            If ``False``, hides the focus term (ANSI index 4) from the UI.
+        optimize_position : bool
+            If ``True``, runs :meth:`refine_offset` before launching the widget.
+        optimize_weights : bool OR int
+            If ``True``, optimizes WGS weights before launching the widget.
+
+        Returns
+        -------
+        :class:`_ZernikeCalibrationWidget`
+            The interactive widget. Results are stored into
+            ``self.calibrations["wavefront_zernike"]`` when the user clicks
+            *Save*.
+        """
+        try:
+            from ipywidgets import Image as _  # noqa: F401
+        except ImportError:
+            raise ImportError("ipywidgets must be installed to use the interactive calibrator.")
+
+        # --- Parse perturbation bounds ---
+        if np.isscalar(perturbation):
+            perturbation_bounds = (-abs(float(perturbation)), abs(float(perturbation)))
+        else:
+            perturbation_bounds = (float(perturbation[0]), float(perturbation[1]))
+
+        # --- Parse calibration_points and zernike_indices (same as wavefront_calibrate_zernike) ---
+        calibration_points_ij = None
+        weights = None
+        spot_integration_width_ij = None
+
+        if calibration_points is None:
+            if "wavefront_zernike" in self.calibrations:
+                dat = self.calibrations["wavefront_zernike"]
+                calibration_points = np.copy(dat["corrected_spots"])
+                calibration_points_ij = np.copy(dat["calibration_points_ij"])
+                spot_integration_width_ij = np.copy(dat["spot_integration_width_ij"])
+
+                if zernike_indices is None:
+                    zernike_indices = np.copy(dat["zernike_indices"])
+                else:
+                    if np.isscalar(zernike_indices) and zernike_indices < calibration_points.shape[0]:
+                        zernike_indices = calibration_points.shape[0]
+
+                    zernike_indices = _zernike_indices_parse(
+                        zernike_indices,
+                        calibration_points.shape[0],
+                        smaller_okay=True,
+                    )
+
+                    stored_zi = np.copy(dat["zernike_indices"])
+                    if len(zernike_indices) >= len(stored_zi):
+                        if not np.all(zernike_indices[:len(stored_zi)] == stored_zi):
+                            raise ValueError(
+                                f"Requested indices {zernike_indices} "
+                                f"is not compatible with stored indices {stored_zi}."
+                            )
+                    else:
+                        raise ValueError(
+                            f"Requested indices {zernike_indices} "
+                            f"is not compatible with stored indices {stored_zi}."
+                        )
+
+                if "weights" in dat:
+                    weights = dat["weights"]
+            else:
+                calibration_points = 100
+
+        if np.isscalar(calibration_points):
+            pitch = np.sqrt(np.prod(self.cam.shape) / calibration_points)
+            calibration_points = self.wavefront_calibration_points(pitch, plot=True)
+            calibration_points = convert_vector(
+                calibration_points, from_units="ij", to_units="zernike", hardware=self
+            )
+
+        calibration_points = format_vectors(np.copy(calibration_points), handle_dimension="pass")
+        zernike_indices = _zernike_indices_parse(
+            zernike_indices, calibration_points.shape[0], smaller_okay=True
+        )
+        dp = len(zernike_indices) - calibration_points.shape[0]
+        if dp:
+            calibration_points = np.pad(calibration_points, ((0, dp), (0, 0)))
+
+        # --- Build hologram ---
+        if calibration_points.shape[1] > 1:
+            hologram = CompressedSpotHologram(
+                spot_vectors=calibration_points,
+                basis=zernike_indices,
+                cameraslm=self,
+            )
+            if weights is not None:
+                hologram.set_weights(weights)
+            if calibration_points_ij is None:
+                calibration_points_ij = hologram.spot_ij
+            else:
+                hologram.spot_ij = calibration_points_ij
+        else:
+            hologram = None
+            if calibration_points_ij is None:
+                calibration_points_ij = convert_vector(
+                    calibration_points,
+                    from_units="zernike",
+                    to_units="ij",
+                    hardware=self,
+                )
+
+        if calibration_points.shape[1] > 1:
+            max_window_size = smallest_distance(calibration_points_ij)
+        else:
+            max_window_size = np.min(self.cam.shape)
+        max_siw = int(2 * np.ceil(np.min((.5 * max_window_size, 51)) / 2) + 1)
+        if spot_integration_width_ij is None:
+            spot_integration_width_ij = max_siw
+        else:
+            spot_integration_width_ij = min(int(spot_integration_width_ij), max_siw)
+        if hologram is not None:
+            hologram.spot_integration_width_ij = spot_integration_width_ij
+
+        # --- Initial hologram optimisation ---
+        if hologram is not None:
+            hologram.optimize("GS", maxiter=3, verbose=0,
+                              stat_groups=["computational_spot"])
+
+        if optimize_weights and hologram is not None:
+            maxiter = 10 if isinstance(optimize_weights, bool) else int(optimize_weights)
+            if maxiter < 1:
+                raise ValueError("optimize_weights must be True, False, or a positive integer.")
+            hologram.optimize(
+                "WGS-Kim",
+                feedback="experimental_spot",
+                maxiter=maxiter,
+                verbose=True,
+                name="optimize_weights",
+                stat_groups=["computational_spot", "experimental_spot"],
+            )
+
+        if optimize_position and hologram is not None:
+            def _tick_tmp():
+                hologram.spot_zernike = calibration_points
+                hologram.optimize("GS", maxiter=3, verbose=0)
+                return hologram.get_phase()
+            self.slm.set_phase(_tick_tmp())
+            hologram.refine_offset(img=None, basis="kxy", force_affine=global_correction, plot=False)
+
+        # --- Create and display interactive widget ---
+        widget = _ZernikeCalibrationWidget(
+            fs=self,
+            calibration_points=calibration_points,
+            zernike_indices=zernike_indices,
+            calibration_points_ij=calibration_points_ij,
+            spot_integration_width_ij=spot_integration_width_ij,
+            hologram=hologram,
+            perturbation_bounds=perturbation_bounds,
+            global_correction=global_correction,
+            optimize_focus=optimize_focus,
+        )
+
+        return widget
+
     ### Superpixel Wavefront Calibration ###
 
     def wavefront_calibrate_superpixel(
@@ -4113,3 +4300,539 @@ class FourierSLM(CameraSLM):
 
 
 FourierSLM.fourier_calibration_build.__doc__ = SimulatedCamera.build_affine.__doc__
+
+
+class _ZernikeCalibrationWidget:
+    """
+    Interactive Jupyter widget for manual Zernike coefficient adjustment.
+
+    Created by :meth:`FourierSLM._wavefront_calibrate_zernike`.  Provides a
+    live camera view with spot markers, per-term (and optionally per-spot)
+    sliders, zoom controls, and click-to-select spot support.
+    """
+
+    def __init__(
+        self,
+        fs,
+        calibration_points,
+        zernike_indices,
+        calibration_points_ij,
+        spot_integration_width_ij,
+        hologram,
+        perturbation_bounds,
+        global_correction,
+        optimize_focus,
+    ):
+        import io as _io
+        import PIL.Image as _PILImage
+        import PIL.ImageDraw as _PILImageDraw
+        from ipywidgets import (
+            Dropdown,
+            FloatSlider,
+            FloatText,
+            BoundedIntText,
+            Button,
+            Image,
+            HTML,
+            Output,
+            HBox,
+            VBox,
+            Layout,
+        )
+        from IPython.display import display
+
+        # ---- store references ------------------------------------------------
+        self.fs = fs
+        self.calibration_points = calibration_points
+        self.initial_points = calibration_points.copy()
+        self.zernike_indices = zernike_indices
+        self.calibration_points_ij = calibration_points_ij
+        self.spot_integration_width_ij = spot_integration_width_ij
+        self.hologram = hologram
+        self.perturbation_bounds = perturbation_bounds
+        self.global_correction = global_correction
+        self.optimize_focus = optimize_focus
+
+        self._io = _io
+        self._PILImage = _PILImage
+        self._PILImageDraw = _PILImageDraw
+        self._syncing = False
+        self._done = False
+        self._last_img = None
+        self._full_crop_offset = (0, 0)
+        self._full_display_scale = 1.0
+
+        N = calibration_points.shape[1]
+
+        # Reusable flex helpers
+        _flex_auto = Layout(width="auto")
+        _flex_grow = Layout(flex="1 1 auto")
+        _flex_row = Layout(
+            display="flex", flex_flow="row wrap",
+            align_items="center", width="100%",
+        )
+        _flex_row_top = Layout(
+            display="flex", flex_flow="row nowrap",
+            align_items="flex-start", width="100%",
+        )
+        _btn_sq = Layout(width="32px", min_width="32px")
+
+        # ---- determine adjustable terms --------------------------------------
+        self._adjustable = []
+        for j, idx in enumerate(zernike_indices):
+            if idx in (0, 1, 2):
+                continue
+            if idx == 4 and not optimize_focus:
+                continue
+            self._adjustable.append((j, int(idx)))
+
+        if len(self._adjustable) == 0:
+            raise ValueError("No adjustable Zernike terms for the given settings.")
+
+        self._current_j, self._current_idx = self._adjustable[0]
+        self._current_spot = 0
+
+        # ---- build term dropdown ---------------------------------------------
+        term_options = []
+        for j, idx in self._adjustable:
+            name = ZERNIKE_NAMES[idx] if idx < len(ZERNIKE_NAMES) else f"index {idx}"
+            term_options.append((f"Z_{idx}: {name}", (j, idx)))
+
+        # ---- determine initial slider value & range --------------------------
+        init_val = self._read_value()
+        lo, hi = perturbation_bounds
+        lo = min(lo, init_val - 0.1)
+        hi = max(hi, init_val + 0.1)
+        step = (hi - lo) / 2000.0
+
+        # ---- widgets ---------------------------------------------------------
+        self._status = HTML(value="<b>Ready</b>", layout=_flex_auto)
+
+        self._term_dropdown = Dropdown(
+            options=term_options,
+            description="Zernike:",
+            layout=_flex_auto,
+        )
+
+        self._coeff_slider = FloatSlider(
+            value=init_val,
+            min=lo,
+            max=hi,
+            step=step,
+            description="Coeff [rad]:",
+            readout=True,
+            readout_format=".4f",
+            continuous_update=False,
+            layout=_flex_grow,
+        )
+
+        self._coeff_text = FloatText(
+            value=init_val,
+            description="Value:",
+            step=0.01,
+            layout=_flex_auto,
+        )
+
+        # Spot selector (unified -- always visible in both modes)
+        self._spot_label = HTML(value="<b>Spot:</b>", layout=_flex_auto)
+        self._spot_prev = Button(description="\u25C0", layout=_btn_sq)
+        self._spot_input = BoundedIntText(
+            value=0, min=0, max=max(N - 1, 0),
+            layout=Layout(width="60px", min_width="60px"),
+        )
+        self._spot_next = Button(description="\u25B6", layout=_btn_sq)
+
+        # Full-image zoom slider
+        self._full_zoom = FloatSlider(
+            value=1.0, min=1.0, max=8.0, step=0.25,
+            description="Zoom:",
+            readout=True,
+            readout_format=".1f",
+            continuous_update=False,
+            layout=_flex_grow,
+        )
+
+        # Spot crop pixel-radius control
+        max_half = spot_integration_width_ij // 2
+        self._spot_radius = BoundedIntText(
+            value=max_half,
+            min=1,
+            max=max_half,
+            description="Radius [px]:",
+            layout=_flex_auto,
+        )
+
+        # Image displays
+        self._full_image = Image(format="png", layout=Layout(width="100%"))
+        self._zoom_image = Image(format="png", layout=_flex_auto)
+
+        # Action buttons
+        self._reset_btn = Button(
+            description="Reset",
+            button_style="danger",
+            layout=_flex_auto,
+        )
+        self._save_btn = Button(
+            description="Save",
+            button_style="success",
+            layout=_flex_auto,
+        )
+
+        self._output = Output()
+
+        # ---- wire callbacks --------------------------------------------------
+        self._term_dropdown.observe(self._on_term_change, names="value")
+        self._coeff_slider.observe(self._on_slider_change, names="value")
+        self._coeff_text.observe(self._on_text_change, names="value")
+        self._spot_input.observe(self._on_spot_change, names="value")
+        self._spot_prev.on_click(lambda _: self._step_spot(-1))
+        self._spot_next.on_click(lambda _: self._step_spot(1))
+        self._full_zoom.observe(self._on_full_zoom_change, names="value")
+        self._spot_radius.observe(self._on_spot_radius_change, names="value")
+        self._reset_btn.on_click(self._on_reset)
+        self._save_btn.on_click(self._on_save)
+
+        # ---- optional click-to-select via ipyevents --------------------------
+        self._click_event = None
+        try:
+            from ipyevents import Event
+            self._click_event = Event(
+                source=self._full_image, watched_events=["click"]
+            )
+            self._click_event.on_dom_event(self._on_image_click)
+        except ImportError:
+            pass
+
+        # ---- layout (unified for both modes) ---------------------------------
+        row1 = HBox(
+            [
+                self._term_dropdown,
+                self._spot_label,
+                self._spot_prev,
+                self._spot_input,
+                self._spot_next,
+                self._status,
+            ],
+            layout=_flex_row,
+        )
+
+        row2 = HBox([self._coeff_text, self._coeff_slider], layout=_flex_row)
+
+        left_panel = VBox(
+            [self._full_image, self._full_zoom],
+            layout=Layout(flex="3 1 0%", min_width="0"),
+        )
+        right_panel = VBox(
+            [self._zoom_image, self._spot_radius],
+            layout=Layout(flex="1 1 0%", min_width="0"),
+        )
+        row3 = HBox([left_panel, right_panel], layout=_flex_row_top)
+
+        row4 = HBox([self._reset_btn, self._save_btn], layout=_flex_row)
+
+        self._layout = VBox(
+            [row1, row2, row3, row4, self._output],
+            layout=Layout(width="100%"),
+        )
+        display(self._layout)
+
+        # ---- initial render --------------------------------------------------
+        self._apply_and_render()
+        if self._click_event:
+            with self._output:
+                print("Tip: click on the camera image to select a spot.")
+
+    # ------------------------------------------------------------------
+    # Value helpers
+    # ------------------------------------------------------------------
+
+    def _read_value(self):
+        """Return the current coefficient for the active term/spot."""
+        j = self._current_j
+        if self.global_correction:
+            return float(np.mean(self.calibration_points[j, :]))
+        else:
+            return float(self.calibration_points[j, self._current_spot])
+
+    # ------------------------------------------------------------------
+    # SLM / camera pipeline
+    # ------------------------------------------------------------------
+
+    def _tick(self):
+        """Generate the SLM phase pattern from current calibration_points."""
+        if self.hologram is None:
+            return zernike_sum(
+                self.fs.slm,
+                self.zernike_indices,
+                self.calibration_points,
+                use_mask=False,
+            )
+        else:
+            self.hologram.spot_zernike = self.calibration_points
+            self.hologram.optimize("GS", maxiter=3, verbose=0)
+            return self.hologram.get_phase()
+
+    # ------------------------------------------------------------------
+    # Rendering helpers
+    # ------------------------------------------------------------------
+
+    def _pil_to_png_bytes(self, pil_img):
+        """Serialise a PIL Image to PNG bytes."""
+        buff = self._io.BytesIO()
+        pil_img.save(buff, format="png")
+        return buff.getvalue()
+
+    def _gray_to_pil(self, img):
+        """Normalise a float/int array to 0-255 and return a PIL ``'L'`` image."""
+        img = np.clip(np.asarray(img, dtype=float), 0, None)
+        mx = img.max()
+        if mx > 0:
+            img = (img / mx * 255).astype(np.uint8)
+        else:
+            img = np.zeros_like(img, dtype=np.uint8)
+        return self._PILImage.fromarray(img, mode="L")
+
+    def _render_full(self, img):
+        """Render the full camera image with spot markers and zoom crop."""
+        if img is None:
+            return
+        h, w = img.shape
+        zoom_level = self._full_zoom.value
+        selected = self._current_spot
+
+        if zoom_level > 1.0:
+            ci = float(self.calibration_points_ij[0, selected])
+            cj = float(self.calibration_points_ij[1, selected])
+            crop_w = max(int(w / zoom_level), 32)
+            crop_h = max(int(h / zoom_level), 32)
+            x0 = int(np.clip(ci - crop_w / 2, 0, w - crop_w))
+            y0 = int(np.clip(cj - crop_h / 2, 0, h - crop_h))
+            cropped = img[y0 : y0 + crop_h, x0 : x0 + crop_w]
+        else:
+            cropped = img
+            x0, y0 = 0, 0
+
+        display_w = min(600, w)
+        scale = display_w / cropped.shape[1]
+        self._full_crop_offset = (x0, y0)
+        self._full_display_scale = scale
+
+        pil_img = self._gray_to_pil(cropped).convert("RGB")
+        if scale != 1.0:
+            new_size = (int(pil_img.width * scale), int(pil_img.height * scale))
+            pil_img = pil_img.resize(new_size, self._PILImage.NEAREST)
+
+        draw = self._PILImageDraw.Draw(pil_img)
+        r = max(4, int(6 * scale))
+        n_spots = self.calibration_points_ij.shape[1]
+        for k in range(n_spots):
+            sx = (float(self.calibration_points_ij[0, k]) - x0) * scale
+            sy = (float(self.calibration_points_ij[1, k]) - y0) * scale
+            if not (0 <= sx < pil_img.width and 0 <= sy < pil_img.height):
+                continue
+            if k == selected:
+                colour = (255, 50, 50)
+                lw = 2
+            else:
+                colour = (50, 220, 50)
+                lw = 1
+            draw.ellipse(
+                [sx - r, sy - r, sx + r, sy + r],
+                outline=colour,
+                width=lw,
+            )
+
+        self._full_image.value = self._pil_to_png_bytes(pil_img)
+
+    def _render_zoom(self, img=None):
+        """Refresh only the zoomed spot view."""
+        if img is None:
+            img = self._last_img
+        if img is None:
+            return
+        spot = self._current_spot
+        radius = int(self._spot_radius.value)
+        size = 2 * radius + 1
+        try:
+            spot_imgs = analysis.take(
+                img,
+                self.calibration_points_ij[:, spot : spot + 1],
+                size,
+                clip=True,
+            )
+            crop = spot_imgs[0].astype(float)
+            pil_crop = self._gray_to_pil(crop)
+            display_px = max(200, 8 * size)
+            pil_crop = pil_crop.resize(
+                (display_px, display_px), self._PILImage.NEAREST
+            )
+            self._zoom_image.value = self._pil_to_png_bytes(pil_crop)
+        except Exception as e:
+            with self._output:
+                print(f"Zoom error: {e}")
+
+    def _apply_and_render(self):
+        """Apply *calibration_points* to the SLM and refresh both views."""
+        if self._done:
+            return
+        try:
+            pattern = self._tick()
+            self.fs.slm.set_phase(pattern, settle=True, phase_correct=False)
+            self.fs.cam.flush()
+            img = self.fs.cam.get_image()
+            self._last_img = img
+            self._render_full(img)
+            self._render_zoom(img)
+        except Exception as e:
+            with self._output:
+                self._output.clear_output(wait=True)
+                print(f"Update error: {e}")
+
+    # ------------------------------------------------------------------
+    # Widget callbacks
+    # ------------------------------------------------------------------
+
+    def _on_term_change(self, change):
+        self._current_j, self._current_idx = change["new"]
+        self._load_slider_for_current()
+        self._status.value = f"<b>Editing Z<sub>{self._current_idx}</sub></b>"
+
+    def _on_spot_change(self, change):
+        self._current_spot = int(change["new"])
+        if not self.global_correction:
+            self._load_slider_for_current()
+        self._render_full(self._last_img)
+        self._render_zoom()
+
+    def _load_slider_for_current(self):
+        """Sync the slider/text to the stored value for the active term/spot."""
+        val = self._read_value()
+        lo, hi = self.perturbation_bounds
+        lo = min(lo, val - 0.1)
+        hi = max(hi, val + 0.1)
+        self._syncing = True
+        self._coeff_slider.min = lo
+        self._coeff_slider.max = hi
+        self._coeff_slider.value = val
+        self._coeff_text.value = val
+        self._syncing = False
+
+    def _on_slider_change(self, change):
+        if self._syncing:
+            return
+        self._syncing = True
+        self._coeff_text.value = change["new"]
+        self._syncing = False
+        self._set_coefficient(change["new"])
+
+    def _on_text_change(self, change):
+        if self._syncing:
+            return
+        val = change["new"]
+        self._syncing = True
+        if val < self._coeff_slider.min:
+            self._coeff_slider.min = val
+        if val > self._coeff_slider.max:
+            self._coeff_slider.max = val
+        self._coeff_slider.value = val
+        self._syncing = False
+        self._set_coefficient(val)
+
+    def _set_coefficient(self, value):
+        """Write the coefficient and trigger hardware update (auto-save)."""
+        j = self._current_j
+        if self.global_correction:
+            self.calibration_points[j, :] = value
+        else:
+            self.calibration_points[j, self._current_spot] = value
+        self._apply_and_render()
+
+    def _on_full_zoom_change(self, _change):
+        if self._last_img is not None:
+            self._render_full(self._last_img)
+
+    def _on_spot_radius_change(self, _change):
+        self._render_zoom()
+
+    def _step_spot(self, delta):
+        N = self.calibration_points.shape[1]
+        self._spot_input.value = int(
+            np.clip(self._spot_input.value + delta, 0, N - 1)
+        )
+
+    def _on_image_click(self, event):
+        """Handle click on the full camera image (requires *ipyevents*)."""
+        try:
+            dx = event.get("offsetX", event.get("clientX", None))
+            dy = event.get("offsetY", event.get("clientY", None))
+            if dx is None or dy is None:
+                return
+            ox, oy = self._full_crop_offset
+            s = self._full_display_scale
+            cam_x = dx / s + ox
+            cam_y = dy / s + oy
+            dists = (
+                (self.calibration_points_ij[0] - cam_x) ** 2
+                + (self.calibration_points_ij[1] - cam_y) ** 2
+            )
+            nearest = int(np.argmin(dists))
+            self._spot_input.value = nearest
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Reset / Save
+    # ------------------------------------------------------------------
+
+    def _on_reset(self, _=None):
+        """Set all adjustable Zernike coefficients to zero."""
+        for j, _ in self._adjustable:
+            self.calibration_points[j, :] = 0.0
+        self._load_slider_for_current()
+        self._apply_and_render()
+        with self._output:
+            self._output.clear_output(wait=True)
+            print("All adjustable Zernike coefficients reset to zero.")
+
+    def _on_save(self, _=None):
+        """Persist current coefficients and disable the widget."""
+        pattern = self._tick()
+        self.fs.slm.set_phase(pattern, settle=True, phase_correct=False)
+
+        self.fs.calibrations["wavefront_zernike"] = {
+            "initial_points": self.initial_points,
+            "zernike_indices": self.zernike_indices,
+            "corrected_spots": self.calibration_points.copy(),
+            "calibration_points_ij": self.calibration_points_ij,
+            "spot_integration_width_ij": self.spot_integration_width_ij,
+            "weights": (
+                self.hologram.get_weights() if self.hologram is not None else None
+            ),
+        }
+        self.fs.calibrations["wavefront_zernike"].update(
+            self.fs._get_calibration_metadata()
+        )
+
+        self._done = True
+        self._status.value = "<b style='color:blue'>Saved</b>"
+
+        for w in (
+            self._coeff_slider,
+            self._coeff_text,
+            self._term_dropdown,
+            self._spot_input,
+            self._spot_radius,
+            self._full_zoom,
+            self._reset_btn,
+            self._save_btn,
+            self._spot_prev,
+            self._spot_next,
+        ):
+            w.disabled = True
+
+        with self._output:
+            self._output.clear_output(wait=True)
+            print(
+                "Calibration saved to fs.calibrations['wavefront_zernike']. "
+                "You may continue with subsequent cells."
+            )
