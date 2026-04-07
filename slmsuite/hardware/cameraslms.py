@@ -6,6 +6,7 @@ import os
 import time
 import cv2
 import copy
+import logging
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import optimize, ndimage
@@ -13,13 +14,15 @@ from scipy.spatial import Delaunay, Voronoi, delaunay_plot_2d
 from tqdm.auto import tqdm
 import warnings
 
+_logger = logging.getLogger(__name__)
+
 from slmsuite import __version__
 from slmsuite.hardware import _Picklable
 from slmsuite.holography import analysis
 from slmsuite.holography import toolbox
 from slmsuite.holography.algorithms import Hologram, SpotHologram, CompressedSpotHologram
 from slmsuite.holography.toolbox import imprint, format_2vectors, format_vectors, smallest_distance, fit_3pt, convert_vector
-from slmsuite.holography.toolbox.phase import blaze, _zernike_indices_parse, zernike, zernike_sum, binary
+from slmsuite.holography.toolbox.phase import blaze, _zernike_indices_parse, zernike, zernike_sum, binary, ZERNIKE_NAMES
 from slmsuite.holography.analysis import image_remove_blaze, image_remove_vortices, image_reduce_wraps
 from slmsuite.holography.analysis.files import load_h5, save_h5, generate_path, latest_path
 from slmsuite.holography.analysis.fitfunctions import cos, _sinc2d_nomod
@@ -2225,6 +2228,198 @@ class FourierSLM(CameraSLM):
 
         pass
 
+    def _wavefront_calibrate_zernike(
+        self,
+        calibration_points=None,
+        zernike_indices=9,
+        perturbation=(-np.pi, np.pi),
+        global_correction=False,
+        optimize_focus=True,
+        optimize_position=True,
+        optimize_weights=True,
+    ):
+        r"""
+        Interactive Jupyter widget for manual Zernike coefficient adjustment.
+
+        Provides a live camera view with sliders for each Zernike term,
+        allowing the user to manually tune coefficients and confirm optimal values.
+        The original :meth:`wavefront_calibrate_zernike` is not modified.
+
+        Parameters
+        ----------
+        calibration_points : numpy.ndarray OR float OR None
+            Same semantics as :meth:`wavefront_calibrate_zernike`.
+        zernike_indices : int OR list of int OR None
+            Same semantics as :meth:`wavefront_calibrate_zernike`.
+        perturbation : (float, float) OR float
+            Slider range in radians. A tuple ``(lower, upper)`` sets the slider
+            bounds directly. A scalar ``p`` is shorthand for ``(-|p|, |p|)``.
+        global_correction : bool
+            Initial mode for the interactive Global / Per-Spot toggle.
+            If ``True``, the slider initially adjusts all spots uniformly
+            (and ``refine_offset`` is run with ``force_affine=True`` during the
+            optional position refinement).
+            If ``False``, the slider initially edits only the selected spot.
+            The user may switch between modes interactively in the widget at
+            any time without restarting the calibration.
+        optimize_focus : bool
+            If ``False``, hides the focus term (ANSI index 4) from the UI.
+        optimize_position : bool
+            If ``True``, runs :meth:`refine_offset` before launching the widget.
+        optimize_weights : bool OR int
+            If ``True``, optimizes WGS weights before launching the widget.
+
+        Returns
+        -------
+        :class:`_ZernikeCalibrationWidget`
+            The interactive widget. Results are stored into
+            ``self.calibrations["wavefront_zernike"]`` when the user clicks
+            *Save*.
+        """
+        try:
+            from ipywidgets import Image as _  # noqa: F401
+        except ImportError:
+            raise ImportError("ipywidgets must be installed to use the interactive calibrator.")
+
+        # --- Parse perturbation bounds ---
+        if np.isscalar(perturbation):
+            perturbation_bounds = (-abs(float(perturbation)), abs(float(perturbation)))
+        else:
+            perturbation_bounds = (float(perturbation[0]), float(perturbation[1]))
+
+        # --- Parse calibration_points and zernike_indices (same as wavefront_calibrate_zernike) ---
+        calibration_points_ij = None
+        weights = None
+        spot_integration_width_ij = None
+
+        if calibration_points is None:
+            if "wavefront_zernike" in self.calibrations:
+                dat = self.calibrations["wavefront_zernike"]
+                calibration_points = np.copy(dat["corrected_spots"])
+                calibration_points_ij = np.copy(dat["calibration_points_ij"])
+                spot_integration_width_ij = np.copy(dat["spot_integration_width_ij"])
+
+                if zernike_indices is None:
+                    zernike_indices = np.copy(dat["zernike_indices"])
+                else:
+                    if np.isscalar(zernike_indices) and zernike_indices < calibration_points.shape[0]:
+                        zernike_indices = calibration_points.shape[0]
+
+                    zernike_indices = _zernike_indices_parse(
+                        zernike_indices,
+                        calibration_points.shape[0],
+                        smaller_okay=True,
+                    )
+
+                    stored_zi = np.copy(dat["zernike_indices"])
+                    if len(zernike_indices) >= len(stored_zi):
+                        if not np.all(zernike_indices[:len(stored_zi)] == stored_zi):
+                            raise ValueError(
+                                f"Requested indices {zernike_indices} "
+                                f"is not compatible with stored indices {stored_zi}."
+                            )
+                    else:
+                        raise ValueError(
+                            f"Requested indices {zernike_indices} "
+                            f"is not compatible with stored indices {stored_zi}."
+                        )
+
+                if "weights" in dat:
+                    weights = dat["weights"]
+            else:
+                calibration_points = 100
+
+        if np.isscalar(calibration_points):
+            pitch = np.sqrt(np.prod(self.cam.shape) / calibration_points)
+            calibration_points = self.wavefront_calibration_points(pitch, plot=True)
+            calibration_points = convert_vector(
+                calibration_points, from_units="ij", to_units="zernike", hardware=self
+            )
+
+        calibration_points = format_vectors(np.copy(calibration_points), handle_dimension="pass")
+        zernike_indices = _zernike_indices_parse(
+            zernike_indices, calibration_points.shape[0], smaller_okay=True
+        )
+        dp = len(zernike_indices) - calibration_points.shape[0]
+        if dp:
+            calibration_points = np.pad(calibration_points, ((0, dp), (0, 0)))
+
+        # --- Build hologram ---
+        if calibration_points.shape[1] > 1:
+            hologram = CompressedSpotHologram(
+                spot_vectors=calibration_points,
+                basis=zernike_indices,
+                cameraslm=self,
+            )
+            if weights is not None:
+                hologram.set_weights(weights)
+            if calibration_points_ij is None:
+                calibration_points_ij = hologram.spot_ij
+            else:
+                hologram.spot_ij = calibration_points_ij
+        else:
+            hologram = None
+            if calibration_points_ij is None:
+                calibration_points_ij = convert_vector(
+                    calibration_points,
+                    from_units="zernike",
+                    to_units="ij",
+                    hardware=self,
+                )
+
+        if calibration_points.shape[1] > 1:
+            max_window_size = smallest_distance(calibration_points_ij)
+        else:
+            max_window_size = np.min(self.cam.shape)
+        max_siw = int(2 * np.ceil(np.min((.5 * max_window_size, 51)) / 2) + 1)
+        if spot_integration_width_ij is None:
+            spot_integration_width_ij = max_siw
+        else:
+            spot_integration_width_ij = min(int(spot_integration_width_ij), max_siw)
+        if hologram is not None:
+            hologram.spot_integration_width_ij = spot_integration_width_ij
+
+        # --- Initial hologram optimisation ---
+        if hologram is not None:
+            hologram.optimize("GS", maxiter=3, verbose=0,
+                              stat_groups=["computational_spot"])
+
+        if optimize_weights and hologram is not None:
+            maxiter = 10 if isinstance(optimize_weights, bool) else int(optimize_weights)
+            if maxiter < 1:
+                raise ValueError("optimize_weights must be True, False, or a positive integer.")
+            hologram.optimize(
+                "WGS-Kim",
+                feedback="experimental_spot",
+                maxiter=maxiter,
+                verbose=True,
+                name="optimize_weights",
+                stat_groups=["computational_spot", "experimental_spot"],
+            )
+
+        if optimize_position and hologram is not None:
+            def _tick_tmp():
+                hologram.spot_zernike = calibration_points
+                hologram.optimize("GS", maxiter=3, verbose=0)
+                return hologram.get_phase()
+            self.slm.set_phase(_tick_tmp())
+            hologram.refine_offset(img=None, basis="kxy", force_affine=global_correction, plot=False)
+
+        # --- Create and display interactive widget ---
+        widget = _ZernikeCalibrationWidget(
+            fs=self,
+            calibration_points=calibration_points,
+            zernike_indices=zernike_indices,
+            calibration_points_ij=calibration_points_ij,
+            spot_integration_width_ij=spot_integration_width_ij,
+            hologram=hologram,
+            perturbation_bounds=perturbation_bounds,
+            global_correction=global_correction,
+            optimize_focus=optimize_focus,
+        )
+
+        return widget
+
     ### Superpixel Wavefront Calibration ###
 
     def wavefront_calibrate_superpixel(
@@ -4113,3 +4308,904 @@ class FourierSLM(CameraSLM):
 
 
 FourierSLM.fourier_calibration_build.__doc__ = SimulatedCamera.build_affine.__doc__
+
+
+class _ZernikeCalibrationWidget:
+    """
+    Interactive Jupyter widget for manual Zernike coefficient adjustment.
+
+    Created by :meth:`FourierSLM._wavefront_calibrate_zernike`.  Provides a
+    live camera view with spot markers, per-term sliders, zoom controls,
+    a hot-swappable Global / Per-Spot mode toggle, and click-to-select
+    spot support (when the optional :mod:`ipyevents` package is installed).
+
+    Notes
+    -----
+    Rendering is performed via :mod:`cv2` (resize + draw + PNG encode) for
+    efficiency; the displayed image is rendered at fixed pixel dimensions so
+    that mouse coordinates from :mod:`ipyevents` map directly into camera
+    pixels without any CSS-stretch ambiguity. The widget additionally consults
+    ``boundingRectWidth/Height`` from the click event as a defensive fallback
+    in case the image is ever scaled by the host theme/layout.
+    """
+
+    # Natural display sizes for the embedded camera images. The 3:1 height
+    # ratio between the full and zoomed views is enforced here.
+    _FULL_DISPLAY_HEIGHT = 540
+    _FULL_DISPLAY_MAX_WIDTH = 960
+    _ZOOM_DISPLAY_SIZE = _FULL_DISPLAY_HEIGHT // 3  # 3:1 height ratio (180px)
+    # Both panels share an explicit pixel height so the right-panel flex
+    # spacer has a definite parent height to grow into; without this,
+    # ``flex-grow`` on the spacer was a no-op because the parent VBox
+    # collapsed to ``height: auto`` (= max-content). The +40 buffer covers
+    # the zoom slider (~32px) plus a few pixels of margin.
+    _PANEL_HEIGHT = _FULL_DISPLAY_HEIGHT + 40
+
+    def __init__(
+        self,
+        fs,
+        calibration_points,
+        zernike_indices,
+        calibration_points_ij,
+        spot_integration_width_ij,
+        hologram,
+        perturbation_bounds,
+        global_correction,
+        optimize_focus,
+    ):
+        from ipywidgets import (
+            Box,
+            Dropdown,
+            FloatSlider,
+            FloatText,
+            BoundedIntText,
+            Button,
+            Image,
+            HTML,
+            Output,
+            HBox,
+            VBox,
+            Layout,
+            ToggleButtons,
+        )
+        from IPython.display import display
+
+        # ---- store references ------------------------------------------------
+        self.fs = fs
+        self.calibration_points = calibration_points
+        self.initial_points = calibration_points.copy()
+        self.zernike_indices = zernike_indices
+        self.calibration_points_ij = calibration_points_ij
+        self.spot_integration_width_ij = spot_integration_width_ij
+        self.hologram = hologram
+        self.perturbation_bounds = perturbation_bounds
+        # ``global_correction`` is now the *initial* mode for the toggle.
+        self.global_correction = bool(global_correction)
+        self.optimize_focus = optimize_focus
+
+        self._syncing = False
+        self._done = False
+        self._last_img = None
+        self._full_crop_offset = (0, 0)
+        self._full_display_scale = 1.0
+        self._full_natural_size = (0, 0)
+
+        N = calibration_points.shape[1]
+
+        # Reusable layout helpers.
+        #
+        # ``_INPUT_DESC_WIDTH`` fixes the description label column for *all*
+        # right-panel inputs so their input fields share a common left edge.
+        # The slider row below the coefficient input pads its left side by
+        # the same amount, putting the slider track flush with the inputs.
+        _INPUT_DESC_WIDTH = "120px"
+        _input_style = {"description_width": _INPUT_DESC_WIDTH}
+        _flex_row = Layout(
+            display="flex", flex_flow="row wrap",
+            align_items="center", width="100%",
+        )
+        _flex_row_top = Layout(
+            display="flex", flex_flow="row nowrap",
+            align_items="stretch", width="100%",
+            overflow_x="hidden",
+        )
+        _full_field = Layout(width="100%")
+
+        # ---- determine adjustable terms --------------------------------------
+        self._adjustable = []
+        for j, idx in enumerate(zernike_indices):
+            if idx in (0, 1, 2):
+                continue
+            if idx == 4 and not optimize_focus:
+                continue
+            self._adjustable.append((j, int(idx)))
+
+        if len(self._adjustable) == 0:
+            raise ValueError("No adjustable Zernike terms for the given settings.")
+
+        self._current_j, self._current_idx = self._adjustable[0]
+        self._current_spot = 0
+
+        # ---- build term dropdown ---------------------------------------------
+        term_options = []
+        for j, idx in self._adjustable:
+            name = ZERNIKE_NAMES[idx] if idx < len(ZERNIKE_NAMES) else f"index {idx}"
+            term_options.append((f"Z_{idx}: {name}", (j, idx)))
+
+        # ---- determine initial slider value & range --------------------------
+        init_val = self._read_value()
+        lo, hi = perturbation_bounds
+        lo = min(lo, init_val - 0.1)
+        hi = max(hi, init_val + 0.1)
+        step = (hi - lo) / 2000.0
+
+        # ---- top-bar widgets -------------------------------------------------
+        self._reset_btn = Button(
+            description="Reset",
+            button_style="danger",
+            layout=Layout(width="80px", margin="0 4px 0 0"),
+        )
+        self._save_btn = Button(
+            description="Save",
+            button_style="success",
+            layout=Layout(width="80px", margin="0 4px 0 0"),
+        )
+        self._status = HTML(
+            value=self._format_status("Ready", "green"),
+            layout=Layout(width="auto"),
+        )
+
+        # ---- image widgets ---------------------------------------------------
+        # Fixed pixel sizes ensure that `offsetX/Y` from ipyevents click events
+        # map 1:1 to PNG natural pixels (no CSS stretching). On narrow viewports
+        # the layout simply scrolls, but the click mapping remains correct.
+        self._full_image = Image(
+            format="png",
+            layout=Layout(
+                width=f"{self._FULL_DISPLAY_MAX_WIDTH}px",
+                height=f"{self._FULL_DISPLAY_HEIGHT}px",
+                max_width="100%",
+                object_fit="contain",
+            ),
+        )
+        self._zoom_image = Image(
+            format="png",
+            layout=Layout(
+                width=f"{self._ZOOM_DISPLAY_SIZE}px",
+                height=f"{self._ZOOM_DISPLAY_SIZE}px",
+            ),
+        )
+
+        # ---- right-panel control widgets ------------------------------------
+        max_half = spot_integration_width_ij // 2
+        self._spot_radius = BoundedIntText(
+            value=max_half,
+            min=1,
+            max=max_half,
+            description="Radius [pixel]:",
+            style=_input_style,
+            layout=_full_field,
+        )
+
+        self._spot_input = BoundedIntText(
+            value=0,
+            min=0,
+            max=max(N - 1, 0),
+            description="Spot:",
+            style=_input_style,
+            layout=_full_field,
+        )
+
+        # Mode toggle. ipywidgets collapses the description column when
+        # ``description=""`` is set (regardless of ``description_width``),
+        # so any attempt to align the buttons with the input fields'
+        # left edge via an empty description is futile. We accept the
+        # natural left-flush layout for the toggle.
+        #
+        # ``max_width: 100%`` prevents the natural button row from poking
+        # past the panel's content area on themes whose button padding is
+        # generous (which would otherwise trigger a horizontal scrollbar).
+        self._mode_toggle = ToggleButtons(
+            options=[("Global Mode", True), ("Local Mode", False)],
+            value=self.global_correction,
+            style={"button_width": "auto"},
+            layout=Layout(width="auto", max_width="100%"),
+        )
+
+        self._term_dropdown = Dropdown(
+            options=term_options,
+            description="Term:",
+            style=_input_style,
+            layout=_full_field,
+        )
+
+        self._coeff_text = FloatText(
+            value=init_val,
+            description="Coefficient [rad]:",
+            step=0.01,
+            style=_input_style,
+            layout=_full_field,
+        )
+
+        # Slider with no inline readout. The numeric bounds are shown as
+        # explicit (compact) labels on either side; the editable number is in
+        # ``_coeff_text`` above.
+        self._coeff_slider = FloatSlider(
+            value=init_val,
+            min=lo,
+            max=hi,
+            step=step,
+            readout=False,
+            continuous_update=False,
+            layout=Layout(
+                flex="1 1 0%", min_width="60px", margin="0 4px",
+            ),
+        )
+        self._slider_min_label = HTML(
+            value=self._format_bound(lo),
+            layout=Layout(width="auto", flex="0 0 auto"),
+        )
+        self._slider_max_label = HTML(
+            value=self._format_bound(hi),
+            layout=Layout(width="auto", flex="0 0 auto"),
+        )
+        # Stash the shared description width so layout assembly below can pad
+        # the slider row by the matching amount.
+        self._input_desc_width = _INPUT_DESC_WIDTH
+
+        # Full-image zoom slider (sits below the full image).
+        # * ``max_width`` keeps it from stretching to the full left-panel width.
+        # * ``margin: auto 0 0 0`` pins the slider to the *bottom* of the left
+        #   panel so the visible content of the left and right panels share a
+        #   common bottom edge (the right panel uses a flex spacer for the
+        #   same purpose).
+        self._full_zoom = FloatSlider(
+            value=1.0, min=1.0, max=8.0, step=0.25,
+            description="Zoom:",
+            readout=True,
+            readout_format=".1f",
+            continuous_update=False,
+            layout=Layout(
+                width="auto", max_width="360px",
+                margin="auto 0 0 0",
+            ),
+        )
+
+        self._output = Output()
+
+        # ---- wire callbacks --------------------------------------------------
+        self._term_dropdown.observe(self._on_term_change, names="value")
+        self._coeff_slider.observe(self._on_slider_change, names="value")
+        self._coeff_text.observe(self._on_text_change, names="value")
+        self._spot_input.observe(self._on_spot_change, names="value")
+        self._mode_toggle.observe(self._on_mode_change, names="value")
+        self._full_zoom.observe(self._on_full_zoom_change, names="value")
+        self._spot_radius.observe(self._on_spot_radius_change, names="value")
+        self._reset_btn.on_click(self._on_reset)
+        self._save_btn.on_click(self._on_save)
+
+        # ---- optional click-to-select via ipyevents --------------------------
+        self._click_event = None
+        self._click_supported = False
+        try:
+            from ipyevents import Event
+            self._click_event = Event(
+                source=self._full_image,
+                watched_events=["click"],
+                prevent_default_action=True,
+            )
+            self._click_event.on_dom_event(self._on_image_click)
+            self._click_supported = True
+        except ImportError:
+            msg = (
+                "Tip: install 'ipyevents' to enable click-to-select "
+                "functionality on the camera image."
+            )
+            warnings.warn(msg, stacklevel=2)
+            _logger.info(msg)
+
+        # ---- assemble layout -------------------------------------------------
+        # Top bar: [Reset][Save]   ............   [Status]
+        top_left = HBox(
+            [self._reset_btn, self._save_btn],
+            layout=Layout(width="auto"),
+        )
+        top_right = HBox(
+            [self._status],
+            layout=Layout(
+                flex="1 1 auto", justify_content="flex-end",
+                align_items="center",
+            ),
+        )
+        top_bar = HBox(
+            [top_left, top_right],
+            layout=Layout(
+                width="100%", justify_content="space-between",
+                align_items="center", margin="0 0 8px 0",
+            ),
+        )
+
+        # Coefficient slider row.
+        #
+        # Originally we added a left padding of ``_input_desc_width`` to align
+        # the slider with the input fields above. That intermittently
+        # overflowed the right panel and triggered a horizontal scrollbar
+        # (``width: 100% + padding`` is content-box safe only if the inherited
+        # ``box-sizing: border-box`` is honoured -- which depends on the
+        # ipywidgets/theme version).
+        #
+        # Using an explicit invisible spacer widget instead makes the row's
+        # geometry unambiguous: ``width: 100%`` literally means "fill parent
+        # content area", and the spacer simply consumes the first
+        # ``_input_desc_width`` pixels. No box-sizing assumptions required.
+        slider_row_spacer = HTML(
+            value="",
+            layout=Layout(
+                width=self._input_desc_width,
+                flex="0 0 auto",
+            ),
+        )
+        coeff_row = HBox(
+            [
+                slider_row_spacer,
+                self._slider_min_label,
+                self._coeff_slider,
+                self._slider_max_label,
+            ],
+            layout=Layout(width="100%", align_items="center"),
+        )
+
+        # Vertical spacer used to push the calibration-control group to the
+        # bottom of the right panel. ``flex: 1`` (== ``1 1 0%``) gives it a
+        # zero basis with grow=1 so it absorbs all leftover vertical space.
+        # The flex-grow only takes effect when the parent VBox has a definite
+        # height -- that is provided by ``height=_PANEL_HEIGHT`` on the panel
+        # below.
+        right_spacer = Box(
+            layout=Layout(flex="1 1 0%", min_height="8px"),
+        )
+
+        # Right panel: two logical groups separated by ``right_spacer``.
+        #   Top group (Spot-related):
+        #     - zoom_image
+        #     - Radius
+        #     - Spot
+        #   Bottom group (calibration-related):
+        #     - Mode toggle (Global / Local)
+        #     - Term dropdown
+        #     - Coefficient text
+        #     - Coefficient slider row
+        #
+        # Layout notes:
+        # * ``height=_PANEL_HEIGHT`` gives the VBox a definite main-axis size
+        #   so the flex spacer can actually grow (``height: 100%`` was
+        #   unreliable because the parent HBox is auto-height).
+        # * ``box_sizing="border-box"`` so ``min_width`` and any width assigned
+        #   by the parent flex include the 12px padding -- otherwise some
+        #   themes treat this as content-box, the padding adds 24px to the
+        #   visual size, and the panel pokes past its allotted space.
+        # * Symmetric ``padding="0 12px 0 12px"`` gives the input widgets a
+        #   12px buffer on each side so their borders never reach the panel
+        #   edge.
+        # * ``overflow_x="hidden"`` is required for PyCharm's notebook viewer:
+        #   PyCharm applies ``overflow-x: auto`` to the underlying
+        #   ``.widget-vbox`` element, which surfaces a horizontal scrollbar
+        #   whenever a child has even a sub-pixel overflow (a common
+        #   side-effect of the way themes round flex-distributed widths).
+        #   We've eliminated *real* overflow above; this just suppresses the
+        #   stray scrollbar PyCharm would otherwise show. ``overflow_y`` is
+        #   left at the default so any vertical overflow (e.g. unusually
+        #   tall theme buttons) is still visible.
+        right_panel = VBox(
+            [
+                # --- top (Spot) group ---
+                self._zoom_image,
+                self._spot_radius,
+                self._spot_input,
+                # --- elastic spacer ---
+                right_spacer,
+                # --- bottom (calibration) group ---
+                self._mode_toggle,
+                self._term_dropdown,
+                self._coeff_text,
+                coeff_row,
+            ],
+            layout=Layout(
+                flex="1 1 0%",
+                min_width="320px",
+                height=f"{self._PANEL_HEIGHT}px",
+                padding="0 12px 0 12px",
+                box_sizing="border-box",
+                overflow_x="hidden",
+            ),
+        )
+
+        # Left panel: full image + zoom slider. The same explicit height as
+        # the right panel ensures both panels' bottom edges are aligned;
+        # ``margin-top: auto`` on the zoom slider (set above) then pushes the
+        # slider to that shared bottom edge.
+        left_panel = VBox(
+            [self._full_image, self._full_zoom],
+            layout=Layout(
+                flex="3 1 0%",
+                min_width="0",
+                height=f"{self._PANEL_HEIGHT}px",
+            ),
+        )
+
+        body = HBox([left_panel, right_panel], layout=_flex_row_top)
+
+        # Outer width caps the whole widget at ~2/3 of the cell width.
+        # ``max_width`` keeps it well-behaved on narrow notebook themes.
+        self._layout = VBox(
+            [top_bar, body, self._output],
+            layout=Layout(
+                width="66%", max_width="100%",
+                overflow="hidden",
+            ),
+        )
+        display(self._layout)
+
+        # ---- initial render --------------------------------------------------
+        self._apply_and_render()
+        if self._click_supported:
+            with self._output:
+                print("Tip: click on the camera image to select a spot.")
+
+    # ------------------------------------------------------------------
+    # Status helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_status(message, color):
+        """Return formatted HTML for the status indicator."""
+        return (
+            f"<span style='color:{color}; font-weight:bold;'>"
+            f"&#x25CF; {message}</span>"
+        )
+
+    @staticmethod
+    def _format_bound(value):
+        """Return formatted HTML for a slider min/max label.
+
+        Uses a compact two-decimal representation so the labels remain narrow
+        and do not crowd the slider track inside the right panel.
+        """
+        return (
+            "<span style='font-family:monospace; font-size:0.85em; "
+            "white-space:nowrap;'>"
+            f"{value:+.2f}</span>"
+        )
+
+    def _set_status(self, message, color="green"):
+        """Update the status indicator (also forces an immediate kernel flush)."""
+        self._status.value = self._format_status(message, color)
+
+    def _handle_error(self, context, exc):
+        """Centralised error handler: log, surface to status, and dump traceback."""
+        _logger.exception("[%s] %s", context, exc)
+        self._set_status(f"Error: {context}", color="red")
+        with self._output:
+            print(f"[{context}] {type(exc).__name__}: {exc}")
+
+    # ------------------------------------------------------------------
+    # Value helpers
+    # ------------------------------------------------------------------
+
+    def _read_value(self):
+        """Return the displayed coefficient for the active term/spot."""
+        j = self._current_j
+        if self.global_correction:
+            return float(np.mean(self.calibration_points[j, :]))
+        return float(self.calibration_points[j, self._current_spot])
+
+    # ------------------------------------------------------------------
+    # SLM / camera pipeline
+    # ------------------------------------------------------------------
+
+    def _tick(self):
+        """Generate the SLM phase pattern from current calibration_points."""
+        if self.hologram is None:
+            return zernike_sum(
+                self.fs.slm,
+                self.zernike_indices,
+                self.calibration_points,
+                use_mask=False,
+            )
+        self.hologram.spot_zernike = self.calibration_points
+        self.hologram.optimize("GS", maxiter=3, verbose=0)
+        return self.hologram.get_phase()
+
+    # ------------------------------------------------------------------
+    # Rendering helpers (cv2-based)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalise_uint8(img):
+        """Normalise an arbitrary 2-D array to uint8 in [0, 255]."""
+        arr = np.clip(np.asarray(img, dtype=np.float32), 0.0, None)
+        mx = float(arr.max()) if arr.size else 0.0
+        if mx > 0.0:
+            arr = (arr * (255.0 / mx))
+        return arr.astype(np.uint8, copy=False)
+
+    @staticmethod
+    def _encode_png(arr):
+        """Encode a uint8 ndarray (gray or BGR) into PNG bytes via cv2."""
+        success, buf = cv2.imencode(".png", arr)
+        if not success:
+            raise RuntimeError("cv2.imencode failed to produce PNG bytes.")
+        return buf.tobytes()
+
+    def _compute_full_target_size(self, src_w, src_h):
+        """Return the (w, h) target size for the rendered full image PNG."""
+        if src_w <= 0 or src_h <= 0:
+            return (1, 1)
+        target_h = self._FULL_DISPLAY_HEIGHT
+        target_w = int(round(target_h * (src_w / src_h)))
+        if target_w > self._FULL_DISPLAY_MAX_WIDTH:
+            target_w = self._FULL_DISPLAY_MAX_WIDTH
+            target_h = int(round(target_w * (src_h / src_w)))
+        return (max(1, target_w), max(1, target_h))
+
+    def _render_full(self, img):
+        """
+        Render the full camera image with spot markers and zoom crop.
+
+        Exceptions are *not* swallowed here so that callers can decide whether
+        to keep showing an "Error" status or fall back to a recovery path.
+        """
+        if img is None:
+            return
+        h, w = img.shape[:2]
+        zoom_level = float(self._full_zoom.value)
+        selected = self._current_spot
+
+        if zoom_level > 1.0:
+            ci = float(self.calibration_points_ij[0, selected])
+            cj = float(self.calibration_points_ij[1, selected])
+            crop_w = max(int(w / zoom_level), 32)
+            crop_h = max(int(h / zoom_level), 32)
+            x0 = int(np.clip(ci - crop_w / 2, 0, max(0, w - crop_w)))
+            y0 = int(np.clip(cj - crop_h / 2, 0, max(0, h - crop_h)))
+            cropped = img[y0:y0 + crop_h, x0:x0 + crop_w]
+        else:
+            cropped = img
+            x0, y0 = 0, 0
+
+        src_h, src_w = cropped.shape[:2]
+        target_w, target_h = self._compute_full_target_size(src_w, src_h)
+        scale = target_h / max(src_h, 1)
+
+        self._full_crop_offset = (x0, y0)
+        self._full_display_scale = scale
+        self._full_natural_size = (target_w, target_h)
+
+        gray = self._normalise_uint8(cropped)
+        # INTER_AREA for clean downscale, INTER_NEAREST when upscaling so the
+        # raw camera pixels remain sharp/discernible.
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_NEAREST
+        resized = cv2.resize(gray, (target_w, target_h), interpolation=interp)
+        bgr = cv2.cvtColor(resized, cv2.COLOR_GRAY2BGR)
+
+        r = max(4, int(round(6 * scale)))
+        n_spots = self.calibration_points_ij.shape[1]
+        for k in range(n_spots):
+            sx = int(round((float(self.calibration_points_ij[0, k]) - x0) * scale))
+            sy = int(round((float(self.calibration_points_ij[1, k]) - y0) * scale))
+            if not (0 <= sx < target_w and 0 <= sy < target_h):
+                continue
+            if k == selected:
+                color = (50, 50, 255)  # red (BGR)
+                thickness = 2
+            else:
+                color = (50, 220, 50)  # green (BGR)
+                thickness = 1
+            cv2.circle(bgr, (sx, sy), r, color, thickness=thickness)
+
+        self._full_image.value = self._encode_png(bgr)
+        # Keep widget size locked to PNG natural size so click coords are
+        # unambiguous (no CSS stretching).
+        self._full_image.layout.width = f"{target_w}px"
+        self._full_image.layout.height = f"{target_h}px"
+
+    def _render_zoom(self, img=None):
+        """
+        Refresh only the zoomed spot view.
+
+        Exceptions propagate to the caller so that error status messages are
+        not stomped on by subsequent unconditional updates.
+        """
+        if img is None:
+            img = self._last_img
+        if img is None:
+            return
+        spot = self._current_spot
+        radius = int(self._spot_radius.value)
+        size = 2 * radius + 1
+        spot_imgs = analysis.take(
+            img,
+            self.calibration_points_ij[:, spot:spot + 1],
+            size,
+            clip=True,
+        )
+        crop = np.asarray(spot_imgs[0])
+        gray = self._normalise_uint8(crop)
+        display_px = self._ZOOM_DISPLAY_SIZE
+        resized = cv2.resize(
+            gray, (display_px, display_px),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        self._zoom_image.value = self._encode_png(resized)
+
+    def _apply_and_render(self):
+        """Apply *calibration_points* to the SLM and refresh both views."""
+        if self._done:
+            return
+        try:
+            self._set_status("Computing phase...", color="orange")
+            pattern = self._tick()
+
+            self._set_status("Updating SLM...", color="orange")
+            self.fs.slm.set_phase(pattern, settle=True, phase_correct=False)
+
+            self._set_status("Capturing...", color="orange")
+            self.fs.cam.flush()
+            img = self.fs.cam.get_image()
+
+            self._set_status("Rendering...", color="orange")
+            self._last_img = img
+            self._render_full(img)
+            self._render_zoom(img)
+
+            self._set_status("Ready", color="green")
+        except Exception as exc:
+            self._handle_error("apply_and_render", exc)
+
+    # ------------------------------------------------------------------
+    # Widget callbacks
+    # ------------------------------------------------------------------
+
+    def _on_term_change(self, change):
+        try:
+            self._current_j, self._current_idx = change["new"]
+            self._load_slider_for_current()
+        except Exception as exc:
+            self._handle_error("term_change", exc)
+
+    def _on_spot_change(self, change):
+        try:
+            self._current_spot = int(change["new"])
+            # Always reload slider for the new selection. In Per-Spot mode this
+            # exposes that spot's stored value; in Global mode the displayed
+            # value (mean across spots) is unchanged but we still refresh
+            # markers/zoom view.
+            self._load_slider_for_current()
+            self._render_full(self._last_img)
+            self._render_zoom()
+        except Exception as exc:
+            self._handle_error("spot_change", exc)
+
+    def _on_mode_change(self, change):
+        """
+        Hot-swap between Global and Per-Spot modes.
+
+        The underlying ``calibration_points`` array is *not* destructively
+        rewritten: per-spot values are preserved when toggling, and only the
+        slider's "what-you-see / what-the-slider-applies-to" semantics change.
+        Subsequent slider/text edits will:
+
+        * Global mode  -> overwrite *all* spots with the new value.
+        * Per-Spot mode -> overwrite only the currently selected spot.
+        """
+        new_mode = bool(change["new"])
+        if new_mode == self.global_correction:
+            return
+        self.global_correction = new_mode
+        # Sync slider to the value that this mode "shows" for the current term.
+        self._load_slider_for_current()
+        self._set_status(
+            f"Switched to {'Global' if new_mode else 'Local'} mode",
+            color="blue",
+        )
+
+    def _load_slider_for_current(self):
+        """Sync the slider/text to the stored value for the active term/spot."""
+        try:
+            val = self._read_value()
+            lo, hi = self.perturbation_bounds
+            lo = min(lo, val - 0.1)
+            hi = max(hi, val + 0.1)
+            self._syncing = True
+            # Order matters: set min/max bracket first to avoid a transient
+            # "value out of bounds" exception when the new value lies outside
+            # the previous range.
+            if lo <= self._coeff_slider.min:
+                self._coeff_slider.min = lo
+                self._coeff_slider.max = hi
+            else:
+                self._coeff_slider.max = hi
+                self._coeff_slider.min = lo
+            self._coeff_slider.value = val
+            self._coeff_text.value = val
+            self._slider_min_label.value = self._format_bound(lo)
+            self._slider_max_label.value = self._format_bound(hi)
+            self._syncing = False
+        except Exception as exc:
+            self._syncing = False
+            self._handle_error("load_slider", exc)
+
+    def _on_slider_change(self, change):
+        if self._syncing:
+            return
+        try:
+            self._syncing = True
+            self._coeff_text.value = change["new"]
+            self._syncing = False
+            self._set_coefficient(change["new"])
+        except Exception as exc:
+            self._syncing = False
+            self._handle_error("slider_change", exc)
+
+    def _on_text_change(self, change):
+        if self._syncing:
+            return
+        try:
+            val = float(change["new"])
+            self._syncing = True
+            if val < self._coeff_slider.min:
+                self._coeff_slider.min = val
+                self._slider_min_label.value = self._format_bound(val)
+            if val > self._coeff_slider.max:
+                self._coeff_slider.max = val
+                self._slider_max_label.value = self._format_bound(val)
+            self._coeff_slider.value = val
+            self._syncing = False
+            self._set_coefficient(val)
+        except Exception as exc:
+            self._syncing = False
+            self._handle_error("text_change", exc)
+
+    def _set_coefficient(self, value):
+        """Write the coefficient and trigger hardware update."""
+        j = self._current_j
+        value = float(value)
+        if self.global_correction:
+            self.calibration_points[j, :] = value
+        else:
+            self.calibration_points[j, self._current_spot] = value
+        self._apply_and_render()
+
+    def _on_full_zoom_change(self, _change):
+        if self._last_img is None:
+            return
+        try:
+            self._render_full(self._last_img)
+        except Exception as exc:
+            self._handle_error("full_zoom_change", exc)
+
+    def _on_spot_radius_change(self, _change):
+        try:
+            self._render_zoom()
+        except Exception as exc:
+            self._handle_error("spot_radius_change", exc)
+
+    def _on_image_click(self, event):
+        """
+        Map a click on the rendered full-image PNG back to a camera pixel and
+        select the nearest calibration spot.
+
+        The click handler is robust to two distinct coordinate systems:
+
+        1. The PNG natural pixel size we used at render time (stored in
+           ``_full_natural_size`` / ``_full_display_scale``).
+        2. The CSS-rendered size of the ``<img>`` element if the host theme or
+           container ever stretches it (e.g. ``width: 100%`` parent). When the
+           ipyevents payload includes ``boundingRectWidth/Height`` we use those
+           to convert CSS pixels back to natural PNG pixels first.
+        """
+        try:
+            offset_x = event.get("offsetX", event.get("relativeX"))
+            offset_y = event.get("offsetY", event.get("relativeY"))
+            if offset_x is None or offset_y is None:
+                return
+
+            nat_w, nat_h = self._full_natural_size
+            if nat_w <= 0 or nat_h <= 0:
+                return
+
+            rect_w = event.get("boundingRectWidth")
+            rect_h = event.get("boundingRectHeight")
+
+            try:
+                rw = float(rect_w) if rect_w is not None else 0.0
+                rh = float(rect_h) if rect_h is not None else 0.0
+            except (TypeError, ValueError):
+                rw = rh = 0.0
+
+            if rw > 0.0 and rh > 0.0:
+                # CSS-rendered size differs from natural: rescale.
+                nat_x = float(offset_x) * (nat_w / rw)
+                nat_y = float(offset_y) * (nat_h / rh)
+            else:
+                # Image not stretched (or info unavailable): use directly.
+                nat_x = float(offset_x)
+                nat_y = float(offset_y)
+
+            ox, oy = self._full_crop_offset
+            scale = self._full_display_scale or 1.0
+            cam_x = nat_x / scale + ox
+            cam_y = nat_y / scale + oy
+
+            dists = (
+                (self.calibration_points_ij[0] - cam_x) ** 2
+                + (self.calibration_points_ij[1] - cam_y) ** 2
+            )
+            nearest = int(np.argmin(dists))
+            # Triggers _on_spot_change which refreshes the views.
+            self._spot_input.value = nearest
+        except Exception as exc:
+            self._handle_error("image_click", exc)
+
+    # ------------------------------------------------------------------
+    # Reset / Save
+    # ------------------------------------------------------------------
+
+    def _on_reset(self, _=None):
+        """Set all adjustable Zernike coefficients to zero."""
+        try:
+            for j, _idx in self._adjustable:
+                self.calibration_points[j, :] = 0.0
+            self._load_slider_for_current()
+            self._apply_and_render()
+            with self._output:
+                self._output.clear_output(wait=True)
+                print("All adjustable Zernike coefficients reset to zero.")
+        except Exception as exc:
+            self._handle_error("reset", exc)
+
+    def _on_save(self, _=None):
+        """Persist current coefficients and disable the widget."""
+        try:
+            self._set_status("Saving...", color="orange")
+            pattern = self._tick()
+            self.fs.slm.set_phase(pattern, settle=True, phase_correct=False)
+
+            self.fs.calibrations["wavefront_zernike"] = {
+                "initial_points": self.initial_points,
+                "zernike_indices": self.zernike_indices,
+                "corrected_spots": self.calibration_points.copy(),
+                "calibration_points_ij": self.calibration_points_ij,
+                "spot_integration_width_ij": self.spot_integration_width_ij,
+                "weights": (
+                    self.hologram.get_weights() if self.hologram is not None else None
+                ),
+            }
+            self.fs.calibrations["wavefront_zernike"].update(
+                self.fs._get_calibration_metadata()
+            )
+
+            self._done = True
+            self._set_status("Saved", color="blue")
+
+            for w in (
+                self._coeff_slider,
+                self._coeff_text,
+                self._term_dropdown,
+                self._spot_input,
+                self._spot_radius,
+                self._full_zoom,
+                self._reset_btn,
+                self._save_btn,
+                self._mode_toggle,
+            ):
+                w.disabled = True
+
+            with self._output:
+                self._output.clear_output(wait=True)
+                print(
+                    "Calibration saved to fs.calibrations['wavefront_zernike']. "
+                    "You may continue with subsequent cells."
+                )
+        except Exception as exc:
+            self._handle_error("save", exc)
